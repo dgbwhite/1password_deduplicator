@@ -5,13 +5,14 @@ from collections import defaultdict
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+import os
 
 # === CONFIGURATION ===
-VAULT_NAME = "David's"          # Change if needed
 CSV_REPORT = "duplicate_report.csv"
-REMOVE_DUPLICATES = False       # Set to True to allow deletions
+REMOVE_DUPLICATES = False       # Set to True if you ever want this script to delete older dupes
 MAX_WORKERS = 8                 # Parallel fetches
 # ======================
+
 
 def run_op(args):
     """Run an op CLI command and return stdout as text or raise on error."""
@@ -20,16 +21,52 @@ def run_op(args):
         raise RuntimeError(f"op {' '.join(args)} failed:\n{result.stderr.strip()}")
     return result.stdout
 
+
+def choose_vault():
+    """
+    Interactively prompt the user to select a vault.
+
+    If OP_VAULT is set in the environment, that is used directly and no prompt is shown.
+    """
+    env_vault = os.environ.get("OP_VAULT")
+    if env_vault:
+        print(f"🔐 Using vault from OP_VAULT: {env_vault}")
+        return env_vault
+
+    print("🔐 Fetching available vaults...")
+    out = run_op(["vault", "list", "--format", "json"])
+    vaults = json.loads(out)
+
+    if not vaults:
+        raise RuntimeError("No vaults found for this account.")
+
+    print("\n📁 Available vaults:")
+    for idx, v in enumerate(vaults, start=1):
+        print(f"  {idx}. {v['name']}")
+
+    while True:
+        choice = input("\nSelect a vault by number: ").strip()
+        if choice.isdigit():
+            i = int(choice)
+            if 1 <= i <= len(vaults):
+                chosen = vaults[i - 1]["name"]
+                print(f"\n✅ Selected vault: {chosen}\n")
+                return chosen
+        print("⚠️ Invalid selection. Please enter a valid number.")
+
+
 def get_item_ids(vault_name):
     """Return list of item IDs from the given vault."""
     out = run_op(["item", "list", "--vault", vault_name, "--format", "json"])
     items = json.loads(out)
     return [item["id"] for item in items]
 
+
 def fetch_one_item(item_id):
     """Fetch a single item JSON by ID."""
     data = run_op(["item", "get", item_id, "--format", "json"])
     return json.loads(data)
+
 
 def fetch_all_items_parallel(ids):
     """Fetch all items in parallel, with a progress bar."""
@@ -48,6 +85,7 @@ def fetch_all_items_parallel(ids):
                 print(f"⚠️ Skipping item {item_id}: {e}")
     return items
 
+
 def normalize_url(href):
     """
     Normalise a URL so that logically identical URLs group together.
@@ -64,11 +102,13 @@ def normalize_url(href):
     except Exception:
         return href or ""
 
+
 def get_domain(href):
     try:
         return urlparse(href).netloc.lower()
     except Exception:
         return ""
+
 
 def is_localhost_domain(domain):
     if not domain:
@@ -78,6 +118,7 @@ def is_localhost_domain(domain):
     if domain.endswith(".local"):
         return True
     return False
+
 
 def get_best_timestamp(item):
     """
@@ -92,6 +133,13 @@ def get_best_timestamp(item):
         or ""
     )
 
+
+def is_protocol_only_url(href):
+    """Detect URLs that are just 'http://' or 'https://' with no host."""
+    href = (href or "").strip().lower()
+    return href in ("http://", "https://")
+
+
 def identify_duplicates(items):
     """
     Group items to find duplicates.
@@ -99,6 +147,8 @@ def identify_duplicates(items):
     Rules:
     - For normal sites: key = (normalized_full_url, username)
     - For localhost / 127.0.0.1 / *.local: key = ("local", username, normalized_title)
+    - For protocol-only URLs ('http://', 'https://'): treat as 'no real URL' and
+      key = ("no_url", username, normalized_title)
     """
     grouped = defaultdict(list)
 
@@ -119,31 +169,38 @@ def identify_duplicates(items):
         if not username:
             continue
 
-        href = urls[0].get("href", "") if urls else ""
-        domain = get_domain(href)
+        href_raw = urls[0].get("href", "") if urls else ""
+        domain = get_domain(href_raw)
+        normalized_href = normalize_url(href_raw) if href_raw else ""
 
+        # Decide grouping key
         if is_localhost_domain(domain):
             # Local app-style entries: use title + username as key
             key = ("local", username.strip().lower(), title.strip().lower())
-            normalized_href = href  # keep original for reporting only
+            effective_url = href_raw  # keep original for reporting only
+        elif is_protocol_only_url(href_raw) or normalized_href in ("http://", "https://", ""):
+            # Protocol-only or effectively no URL: group by title+username
+            key = ("no_url", username.strip().lower(), title.strip().lower())
+            effective_url = ""  # treat as no meaningful URL
         else:
-            if not href:
-                # No URL and not localhost: skip for our purposes
+            if not href_raw:
+                # No URL and not localhost / protocol-only: skip
                 continue
-            normalized_href = normalize_url(href)
             key = (normalized_href, username.strip().lower())
+            effective_url = normalized_href
 
         grouped[key].append({
             "id": item_id,
             "title": title,
             "updated": updated,
-            "url": normalized_href,
+            "url": effective_url,
             "domain": domain,
             "username": username,
         })
 
     # Only keep keys with more than one item (actual duplicates)
     return {k: v for k, v in grouped.items() if len(v) > 1}
+
 
 def write_report(dupes):
     print(f"📝 Writing CSV report to: {CSV_REPORT}")
@@ -171,6 +228,11 @@ def write_report(dupes):
                 _, uname_key, title_key = key
                 url_or_title_key = title_key
                 key_username = uname_key
+            elif key[0] == "no_url":
+                key_type = "no_url"
+                _, uname_key, title_key = key
+                url_or_title_key = title_key
+                key_username = uname_key
             else:
                 key_type = "full_url"
                 url_key, uname_key = key
@@ -179,8 +241,19 @@ def write_report(dupes):
 
             # Newest first (ISO timestamps sort lexicographically fine)
             sorted_group = sorted(group, key=lambda x: x["updated"], reverse=True)
+
+            # Auto title propagation:
+            # If the newest (KEEP) item has an empty title and there exists a
+            # non-empty title in another item, copy that title into the KEEP row
+            keep_item = sorted_group[0]
+            if not keep_item["title"]:
+                for candidate in sorted_group[1:]:
+                    if candidate["title"]:
+                        keep_item["title"] = candidate["title"]
+                        break
+
             for i, item in enumerate(sorted_group):
-                is_newest = "YES" if i == 0 else "NO"
+                is_newest = "YES" if i == 0 else ""  # blank for others
                 action = "KEEP" if i == 0 else "DELETE"
                 writer.writerow({
                     "key_type": key_type,
@@ -194,6 +267,7 @@ def write_report(dupes):
                     "action": action,
                 })
 
+
 def delete_duplicates(dupes):
     print("🗑️ Deleting older duplicates...")
     groups = list(dupes.values())
@@ -205,12 +279,14 @@ def delete_duplicates(dupes):
                 run_op(["item", "delete", item["id"]])
             except Exception as e:
                 print(f"⚠️ Failed to delete {item['title']} ({item['id']}): {e}")
+    print("✅ Deletion complete.")
+
 
 def main():
-    print("🔐 Starting 1Password duplicate scan…")
     try:
-        ids = get_item_ids(VAULT_NAME)
-        print(f"🔎 Found {len(ids)} items in vault '{VAULT_NAME}'.")
+        vault_name = choose_vault()
+        ids = get_item_ids(vault_name)
+        print(f"🔎 Found {len(ids)} items in vault '{vault_name}'.")
         items = fetch_all_items_parallel(ids)
 
         dupes = identify_duplicates(items)
@@ -222,13 +298,12 @@ def main():
 
         if REMOVE_DUPLICATES:
             delete_duplicates(dupes)
-            print("✅ Deletion complete.")
         else:
             print("🛡️ Test mode: no items were deleted.")
-            print(f"📄 Open '{CSV_REPORT}' to review what would be deleted.")
-
+            print(f"📄 Open '{CSV_REPORT}' to review what would be deleted and what titles/URLs are suggested.")
     except Exception as e:
         print(f"❌ Error: {e}")
+
 
 if __name__ == "__main__":
     main()
