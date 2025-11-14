@@ -1,129 +1,149 @@
-# 1Password Duplicate Finder & Cleaner (CLI-Based)
-
 ## Table of Contents
 - [Overview](#overview)
 - [Prerequisites](#prerequisites)
 - [Warning: Back Up Your Vault](#warning-back-up-your-vault)
 - [How the Scripts Work](#how-the-scripts-work)
 - [Usage](#usage)
-- [Vault Selection](#vault-selection)
-- [Safety Features](#safety-features)
-- [Known Limitations](#known-limitations)
-- [Recommended Workflow](#recommended-workflow)
 - [Recent Updates](#recent-updates)
-- [License](#license)
 
----
+# 1Password Duplicate Finder & Cleaner (CLI-Based)
 
-## Overview
+This project contains two Python scripts that help you identify duplicates, clean your data, and apply bulk changes inside a 1Password vault using the official `op` command-line tool.
 
-This project contains two Python scripts designed to identify and safely remove duplicate items from a 1Password vault using the official `op` command-line tool.
+These tools are designed for:
+- People with large or messy vaults accumulated over many years
+- Anyone migrating from another password manager
+- Users who want safe, auditable bulk cleaning
+- Semi-technical users comfortable with the command line
+- Privacy-conscious users (all processing happens locally)
 
-It is built for users who have accumulated hundreds or thousands of items and want a safe, auditable, semi‑automated workflow for cleaning their vault.
+Nothing is sent to external servers. All data stays on your machine.
 
----
+## Script Files
+- `op_dedupe_analyse.py` — safely scans your vault, detects duplicates, and generates a CSV.
+- `op_dedupe_apply_changes.py` — reads that CSV and applies updates, archives, and deletions.
 
-## Prerequisites
+# Prerequisites
 
 - 1Password CLI installed  
-- Signed in via `eval $(op signin)`  
-- Python 3.9+  
-- Python packages: `tqdm`, `python-dateutil`
+  ```sh
+  brew install --cask 1password-cli
+  ```
+- Signed in via:
+  ```sh
+  eval $(op signin)
+  ```
+- Python 3.9+
+- Required Python packages:
+  ```sh
+  pip3 install tqdm python-dateutil
+  ```
 
----
+# ⚠️ Warning: Back Up Your Vault
 
-## Warning: Back Up Your Vault
+Before running any script that modifies your vault, **back up your 1Password data**.
 
-These scripts modify your 1Password data.  
-Before using them:
+Official instructions:  
+https://support.1password.com/back-up-1password-data/
 
-- Understand 1Password backups: https://support.1password.com/backups/  
-- Optionally export your vault: https://support.1password.com/export/  
-- Test on a non‑critical vault first.
+Although the “analyse” script is completely safe, the apply script *modifies your vault*. Always confirm your backup beforehand.
 
----
+# How the Scripts Work
 
-## How the Scripts Work
+## `op_dedupe_analyse.py` (SAFE — analysis only)
 
-### `op_dedupe_report.py`
-- Scans a vault  
-- Fetches items in parallel  
-- Normalises and compares full URLs  
-- Handles localhost and missing URLs  
-- Identifies newest duplicates  
-- Outputs `duplicate_report.csv`  
+This script:
+1. Prompts you to select a vault interactively.
+2. Lists all items via `op item list`.
+3. Loads items in parallel with a progress bar.
+4. Normalises and compares **full URLs**, not just domains.
+5. Handles special cases such as:
+   - entries with empty URLs  
+   - entries whose URL is only a protocol (`http://`, `https://`)
+   - localhost entries (uses fallback matching logic)
+6. Identifies duplicate clusters using:
+   - URL match
+   - title + username match
+   - title-only match
+7. Determines which entry is the *newest* in each cluster.
+8. Writes a CSV containing:
+   - recommended actions (`KEEP`, `DELETE`, `ARCHIVE`)
+   - newest-item flag  
+   - a stable duplicate key  
+   - title/URL fields suitable for manual editing.
 
-### `op_apply_csv_actions.py`
-- Reads the CSV  
-- Applies manual title/URL fixes  
-- Archives items marked `ARCHIVE`  
-- Deletes items marked `DELETE`  
-- Supports dry‑run mode  
+**No changes are made to your vault.**
 
----
+## `op_dedupe_apply_changes.py` (DANGEROUS — modifies vault)
 
-## Usage
+This script:
+1. Reads your `duplicate_report.csv`.
+2. Prompts whether to run in dry-run mode.
+3. Applies **all row-level actions**:
+   - `DELETE` → deletes item via CLI  
+   - `ARCHIVE` → archives item via CLI  
+   - `KEEP` → does nothing  
+4. Also applies **manual edits** you made in the CSV:
+   - Title updates  
+   - URL updates  
+5. Provides a deletion/update progress bar.
+6. Prints a summary report.
 
-### Step 1 — Generate report
+# Usage
+
+## Step 1 — Analyse your vault
 ```sh
-python3 op_dedupe_report.py
+python3 op_dedupe_analyse.py
 ```
 
-### Step 2 — Review CSV
+You will be prompted to choose a vault.
 
-### Step 3 — Apply changes
-```sh
-python3 op_apply_csv_actions.py
+This creates:
+
+```
+duplicate_report.csv
 ```
 
----
+## Step 2 — Review & edit CSV
+Open the file in Excel / Numbers / Google Sheets.
 
-## Vault Selection
+You may:
+- Confirm DELETE or ARCHIVE rows
+- Fix incorrect titles or URLs
+- Leave `is_newest` blank except for the newest item (autogenerated)
 
-The report script prompts you interactively to select a vault.
+## Step 3 — Apply changes
+```sh
+python3 op_dedupe_apply_changes.py
+```
 
----
+The script asks:
 
-## Safety Features
+```
+Run in dry-run mode? [Y/n]:
+```
 
-- No deletions without confirmation  
-- CSV review step  
-- Dry‑run mode  
-- Parallel loading  
-- Newest‑item detection  
+Press **Enter** for safe mode, or **n** to proceed with real changes.
 
----
+# Recent Updates
 
-## Known Limitations
+### Core Improvements
+- Added **interactive vault selection**.
+- Added **ARCHIVE** support in the apply script.
+- Apply script now **reads and applies manual CSV edits** (titles, URLs).
+- Added propagation of **titles** from the item being deleted to the one being kept when appropriate.
+- Full URL matching (not just domain).
+- Improved `url_or_title_key` logic so it never uses `http://` or `https://` as the key.
+- Updated `is_newest` to leave non-newest entries blank rather than using “NO”.
+- Localhost entries handled via fallback heuristics.
 
-- Dependent on data quality  
-- Missing timestamps reduce accuracy  
-- CLI item fetches are slow by design  
+### File Naming (Variant 1)
+- `op_dedupe_analyse.py` — safe analysis/report
+- `op_dedupe_apply_changes.py` — performs updates/deletes/archives
 
----
-
-## Recommended Workflow
-
-1. Scan one vault  
-2. Review CSV  
-3. Run apply script in dry‑run  
-4. Run real apply  
-5. Re‑scan  
-
----
-
-## Recent Updates
-
-- Added interactive vault selection  
-- Added ARCHIVE action support  
-- Improved URL/title matching  
-- Better `url_or_title_key` generation  
-- Newest column now blank instead of NO  
-- Apply script now updates edited fields  
-- README backup warnings added  
+### Documentation
+- Added vault backup warning with official 1Password link.
+- Updated README to reflect new logic and naming.
 
 ---
-
-## License
-
 MIT License
