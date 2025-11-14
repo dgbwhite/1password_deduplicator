@@ -1,129 +1,129 @@
-
 # 1Password Duplicate Finder & Cleaner (CLI-Based)
+
+## Table of Contents
+- [Overview](#overview)
+- [Prerequisites](#prerequisites)
+- [Warning: Back Up Your Vault](#warning-back-up-your-vault)
+- [How the Scripts Work](#how-the-scripts-work)
+- [Usage](#usage)
+- [Vault Selection](#vault-selection)
+- [Safety Features](#safety-features)
+- [Known Limitations](#known-limitations)
+- [Recommended Workflow](#recommended-workflow)
+- [Recent Updates](#recent-updates)
+- [License](#license)
+
+---
+
+## Overview
 
 This project contains two Python scripts designed to identify and safely remove duplicate items from a 1Password vault using the official `op` command-line tool.
 
-It is built for users who have accumulated hundreds or thousands of items over many years and want a safe, auditable, and semi-automated workflow for cleaning their vault.
+It is built for users who have accumulated hundreds or thousands of items and want a safe, auditable, semi‑automated workflow for cleaning their vault.
 
-These scripts are ideal for:
-- Users with large, messy 1Password vaults
-- Users migrating from another password manager
-- Users who want bulk detection and bulk deletion
-- Privacy-conscious technical and semi-technical users
-- Anyone comfortable using the command line
-
-Both scripts run locally and do not transmit vault data anywhere.
-
-## ⚠️ Important – Back up 1Password before using this
-
-These scripts **modify and delete items in your 1Password account**. Although they’re designed to be cautious (CSV review, dry-run mode, newest-item detection), they still operate on live data.
-
-Before you use them, you should:
-
-1. **Understand how 1Password backups work.**  
-   1Password automatically backs up your account data on their servers, but *deleted vaults cannot be restored*, and item deletion is permanent. You can, however, archive items and restore previous versions of individual items. See:  
-   - 1Password backups (official support): https://support.1password.com/backups/
-
-2. **Optionally create your own local export/backup.**  
-   If you want an extra safety net, export your vault (or account) from the 1Password desktop app before running any bulk changes. 1Password supports exporting to formats like **1PUX** (for re-importing into 1Password) and **CSV** (for use in other tools). See:  
-   - How to export your data from the 1Password desktop app: https://support.1password.com/export/
-
-3. **Test on a non-critical vault first.**  
-   If you have multiple vaults, consider creating a small “test” vault, copy a few representative items into it, and run the full workflow (dedupe → CSV review → apply script) there first.
-
-> **You use these scripts at your own risk.** Always review the generated `duplicate_report.csv` carefully, run the delete/apply script in **dry-run mode** first, and only then perform real changes once you’re satisfied.
-
-## Contents
-- `dedupe2_1password.py` — scans a vault, detects duplicates, and exports a CSV report.
-- `delete_from_csv_1password.py` — reads the CSV and performs deletions (with an interactive dry-run mode).
-
-## What the Scripts Do
-
-### `dedupe2_1password.py`
-This script:
-1. Connects to 1Password via the CLI (`op`).
-2. Retrieves all items in the selected vault.
-3. Loads them in parallel with a progress bar.
-4. Normalises full URLs (not just domains).
-5. Applies additional logic for edge cases like localhost URLs or items with missing URLs.
-6. Finds duplicates using multi-pass matching (URL, title+username, title-only).
-7. Identifies the newest item in any duplicate cluster.
-8. Writes a `duplicate_report.csv` containing recommended actions.
-
-**No deletions occur in this script.**
-
-### `delete_from_csv_1password.py`
-This script:
-1. Reads your `duplicate_report.csv`.
-2. Extracts items flagged for deletion.
-3. Asks whether to run in dry-run mode.
-4. Performs deletions via `op item delete <item_id>`.
-5. Provides a progress bar and completion summary.
+---
 
 ## Prerequisites
-- 1Password CLI installed
-- Signed in via `eval $(op signin)`
-- Python 3.9+
+
+- 1Password CLI installed  
+- Signed in via `eval $(op signin)`  
+- Python 3.9+  
 - Python packages: `tqdm`, `python-dateutil`
 
-## Installation
-Install 1Password CLI (macOS):
+---
+
+## Warning: Back Up Your Vault
+
+These scripts modify your 1Password data.  
+Before using them:
+
+- Understand 1Password backups: https://support.1password.com/backups/  
+- Optionally export your vault: https://support.1password.com/export/  
+- Test on a non‑critical vault first.
+
+---
+
+## How the Scripts Work
+
+### `op_dedupe_report.py`
+- Scans a vault  
+- Fetches items in parallel  
+- Normalises and compares full URLs  
+- Handles localhost and missing URLs  
+- Identifies newest duplicates  
+- Outputs `duplicate_report.csv`  
+
+### `op_apply_csv_actions.py`
+- Reads the CSV  
+- Applies manual title/URL fixes  
+- Archives items marked `ARCHIVE`  
+- Deletes items marked `DELETE`  
+- Supports dry‑run mode  
+
+---
+
+## Usage
+
+### Step 1 — Generate report
 ```sh
-brew install --cask 1password-cli
+python3 op_dedupe_report.py
 ```
 
-Install Python dependencies:
+### Step 2 — Review CSV
+
+### Step 3 — Apply changes
 ```sh
-pip3 install tqdm python-dateutil
+python3 op_apply_csv_actions.py
 ```
 
-## How to Use the Scripts
-
-### Step 1 — Generate duplicate report
-```sh
-python3 dedupe2_1password.py
-```
-This produces `duplicate_report.csv`.
-
-### Step 2 — Review the CSV
-Open it in any spreadsheet tool. Only rows marked `DELETE` will be acted on later.
-
-### Step 3 — Delete duplicates
-```sh
-python3 delete_from_csv_1password.py
-```
-When prompted:
-- Press Enter for dry run
-- Type `n` to perform actual deletions
+---
 
 ## Vault Selection
-Set your vault with an environment variable:
-```sh
-OP_VAULT="My Vault" python3 dedupe2_1password.py
-```
-The deletion script does not require vault selection.
+
+The report script prompts you interactively to select a vault.
+
+---
 
 ## Safety Features
-- No deletions without confirmation
-- CSV export allows full audit
-- Dry-run mode
-- Newest-item detection
-- Parallel loading for speed
+
+- No deletions without confirmation  
+- CSV review step  
+- Dry‑run mode  
+- Parallel loading  
+- Newest‑item detection  
+
+---
 
 ## Known Limitations
-- URL matching depends on stored data quality
-- Missing timestamps reduce accuracy
-- Large vaults may take time due to CLI latency
+
+- Dependent on data quality  
+- Missing timestamps reduce accuracy  
+- CLI item fetches are slow by design  
+
+---
 
 ## Recommended Workflow
-1. Scan one vault at a time.
-2. Review CSV manually.
-3. Run dry-run deletion.
-4. Execute real deletion.
-5. Re-scan to confirm cleaning.
 
-## Contributing
-Pull requests are welcome.
+1. Scan one vault  
+2. Review CSV  
+3. Run apply script in dry‑run  
+4. Run real apply  
+5. Re‑scan  
+
+---
+
+## Recent Updates
+
+- Added interactive vault selection  
+- Added ARCHIVE action support  
+- Improved URL/title matching  
+- Better `url_or_title_key` generation  
+- Newest column now blank instead of NO  
+- Apply script now updates edited fields  
+- README backup warnings added  
+
+---
 
 ## License
+
 MIT License
