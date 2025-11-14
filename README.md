@@ -14,6 +14,25 @@ These scripts are ideal for:
 
 Both scripts run locally and do not transmit vault data anywhere.
 
+## ⚠️ Important – Back up 1Password before using this
+
+These scripts **modify and delete items in your 1Password account**. Although they’re designed to be cautious (CSV review, dry-run mode, newest-item detection), they still operate on live data.
+
+Before you use them, you should:
+
+1. **Understand how 1Password backups work.**  
+   1Password automatically backs up your account data on their servers, but *deleted vaults cannot be restored*, and item deletion is permanent. You can, however, archive items and restore previous versions of individual items. See:  
+   - 1Password backups (official support): https://support.1password.com/backups/
+
+2. **Optionally create your own local export/backup.**  
+   If you want an extra safety net, export your vault (or account) from the 1Password desktop app before running any bulk changes. 1Password supports exporting to formats like **1PUX** (for re-importing into 1Password) and **CSV** (for use in other tools). See:  
+   - How to export your data from the 1Password desktop app: https://support.1password.com/export/
+
+3. **Test on a non-critical vault first.**  
+   If you have multiple vaults, consider creating a small “test” vault, copy a few representative items into it, and run the full workflow (dedupe → CSV review → apply script) there first.
+
+> **You use these scripts at your own risk.** Always review the generated `duplicate_report.csv` carefully, run the delete/apply script in **dry-run mode** first, and only then perform real changes once you’re satisfied.
+
 ## Contents
 - `dedupe2_1password.py` — scans a vault, detects duplicates, and exports a CSV report.
 - `delete_from_csv_1password.py` — reads the CSV and performs deletions (with an interactive dry-run mode).
