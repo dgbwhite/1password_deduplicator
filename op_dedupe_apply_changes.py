@@ -4,7 +4,8 @@ from tqdm import tqdm
 
 # === CONFIGURATION ===
 CSV_FILE = "duplicate_report.csv"   # Must match the file from the first script
-ACTION_COLUMN = "action"            # Column that indicates KEEP / DELETE / ARCHIVE
+# For the dedupe report, the "action" is in the "keep_or_delete" column.
+ACTION_COLUMN = "keep_or_delete"    # Column that indicates KEEP / DELETE / REVIEW / ARCHIVE
 DELETE_VALUE = "DELETE"
 ARCHIVE_VALUE = "ARCHIVE"
 # ======================
@@ -21,9 +22,16 @@ def run_op(args):
 def load_from_csv(csv_path):
     """
     Read the CSV and return:
-    - updates: all rows where we should apply title/url changes (KEEP + ARCHIVE + anything not DELETE)
+    - updates: all rows where we should apply title/url changes
+               (anything that is not DELETE; REVIEW and ARCHIVE included)
     - deletes: rows where action == DELETE
     - archives: rows where action == ARCHIVE
+
+    This version is compatible with the dedupe CSV, which has:
+      - item_id
+      - title
+      - keep_or_delete
+      - urls (optional; may contain comma-separated list)
     """
     updates = []
     deletes = []
@@ -31,10 +39,22 @@ def load_from_csv(csv_path):
 
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
-        required_cols = {"item_id", ACTION_COLUMN, "title", "url"}
-        missing = required_cols - set(reader.fieldnames or [])
+        fieldnames = set(reader.fieldnames or [])
+
+        # Required for safe operation with the dedupe CSV.
+        required_cols = {"item_id", ACTION_COLUMN, "title"}
+        missing = required_cols - fieldnames
         if missing:
-            raise RuntimeError(f"CSV is missing required columns: {', '.join(missing)}")
+            raise RuntimeError(
+                f"CSV is missing required columns: {', '.join(sorted(missing))}"
+            )
+
+        has_url_col = "url" in fieldnames
+        has_urls_col = "urls" in fieldnames
+
+        if not (has_url_col or has_urls_col):
+            # We can still run without URL updates; just log it.
+            print("⚠️ CSV has no 'url' or 'urls' column. URL updates will be skipped.")
 
         for row in reader:
             action_raw = row.get(ACTION_COLUMN, "") or ""
@@ -42,27 +62,39 @@ def load_from_csv(csv_path):
 
             item_id = (row.get("item_id") or "").strip()
             title = (row.get("title") or "").strip()
-            url = (row.get("url") or "").strip()
+
+            # Derive a single primary URL value if possible.
+            raw_url = ""
+            if has_url_col:
+                raw_url = row.get("url") or ""
+            elif has_urls_col:
+                # Take the first URL from the comma-separated list.
+                urls_value = row.get("urls") or ""
+                first = urls_value.split(",")[0] if urls_value else ""
+                raw_url = first
+            url = (raw_url or "").strip()
 
             if not item_id:
+                # Skip rows without an item_id – nothing we can safely act on.
                 continue
 
-            record = {
+            item_info = {
                 "id": item_id,
                 "title": title,
                 "url": url,
-                "action_raw": action_raw,
+                "action": action,
             }
 
             if action == DELETE_VALUE:
-                deletes.append(record)
+                deletes.append(item_info)
             elif action == ARCHIVE_VALUE:
-                archives.append(record)
-                # We also want to apply any title/url edits before archiving
-                updates.append(record)
+                archives.append(item_info)
+                # Also include archives in updates, in case title/url was edited.
+                updates.append(item_info)
             else:
-                # KEEP or anything else → treat as “keep, but apply edits”
-                updates.append(record)
+                # Anything that isn't DELETE or ARCHIVE is treated as an "update"
+                # candidate (KEEP / REVIEW, etc).
+                updates.append(item_info)
 
     return updates, deletes, archives
 
@@ -83,7 +115,7 @@ def ask_dry_run(num_updates, num_deletes, num_archives):
 
 
 def apply_updates(updates, dry_run: bool):
-    """Apply title/url updates for rows not marked DELETE."""
+    """Apply title/url updates for rows not marked DELETE-only."""
     if not updates:
         print("✅ No items to update based on CSV.")
         return
@@ -92,14 +124,19 @@ def apply_updates(updates, dry_run: bool):
         print("🛡️ DRY RUN: no updates will be performed.")
         print("The following items WOULD be updated (title/url):")
         for item in updates:
-            print(f" - {item['id']}  |  title -> '{item['title']}'  |  url -> '{item['url']}'")
+            print(
+                f" - {item['id']}  |  title -> '{item['title']}'"
+                f"  |  url -> '{item['url']}'"
+            )
         return
 
     print("✏️ Applying title/url updates from CSV...")
     for item in tqdm(updates, desc="✏️ Updating", unit="item"):
         args = ["item", "edit", item["id"]]
+
         if item["title"]:
             args += ["--title", item["title"]]
+
         if item["url"]:
             # Assumes op CLI supports --url to set the primary URL
             args += ["--url", item["url"]]
@@ -130,12 +167,12 @@ def apply_archives(archives, dry_run: bool):
     print("📦 Archiving items marked as ARCHIVE in the CSV...")
     for item in tqdm(archives, desc="📦 Archiving", unit="item"):
         try:
-            # Use --archive to move item to Archive instead of permanent delete
+            # 1Password CLI supports archiving via item delete with --archive
             run_op(["item", "delete", item["id"], "--archive"])
         except Exception as e:
             print(f"⚠️ Failed to archive {item['title']} ({item['id']}): {e}")
 
-    print("✅ Archiving run complete.")
+    print("✅ Archiving complete.")
 
 
 def apply_deletes(deletes, dry_run: bool):
@@ -158,11 +195,10 @@ def apply_deletes(deletes, dry_run: bool):
         except Exception as e:
             print(f"⚠️ Failed to delete {item['title']} ({item['id']}): {e}")
 
-    print("✅ Deletion run complete.")
+    print("✅ Deletion complete.")
 
 
 def main():
-    print(f"🔐 Reading instructions from '{CSV_FILE}'…")
     try:
         updates, deletes, archives = load_from_csv(CSV_FILE)
         dry_run = ask_dry_run(len(updates), len(deletes), len(archives))
