@@ -6,28 +6,197 @@ from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import os
+import time
+import argparse
+from datetime import datetime, timezone
 
 # === CONFIGURATION ===
 CSV_REPORT = "duplicate_report.csv"
-REMOVE_DUPLICATES = False       # Set to True if you ever want this script to delete older dupes
-MAX_WORKERS = 8                 # Parallel fetches
+REMOVE_DUPLICATES = False       # Set to True if you ever want this script to delete items
+MAX_WORKERS = 8                 # Default parallel fetches; can be overridden via --workers
 # ======================
 
+TRANSIENT_PATTERNS = [
+    "connection reset by peer",
+    "tls handshake timeout",
+    "eof",
+    "temporary failure",
+    "timeout awaiting response",
+    # add more if you want them treated as transient, e.g.:
+    # "broken pipe",
+    # "bad record mac",
+]
 
-def run_op(args):
-    """Run an op CLI command and return stdout as text or raise on error."""
-    result = subprocess.run(["op"] + args, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"op {' '.join(args)} failed:\n{result.stderr.strip()}")
-    return result.stdout
+
+def is_transient_error(stderr: str) -> bool:
+    """Return True if stderr from `op` looks like a transient network issue."""
+    s = stderr.lower()
+    return any(pat in s for pat in TRANSIENT_PATTERNS)
+
+
+def run_op(args, retries: int = 3, base_delay: float = 1.0):
+    """Run an op CLI command and return stdout as text, with limited retries."""
+    cmd = ["op"] + args
+
+    for attempt in range(1, retries + 1):
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            return result.stdout
+
+        stderr = result.stderr.strip()
+        # If it's the last attempt or not a transient error, fail fast
+        if attempt == retries or not is_transient_error(stderr):
+            raise RuntimeError(
+                f"op {' '.join(args)} failed (attempt {attempt}/{retries}):\n{stderr}"
+            )
+
+        # Back off a bit before retrying
+        delay = base_delay * attempt
+        print(
+            f"⏳ Transient error on {' '.join(args)} "
+            f"(attempt {attempt}/{retries}), retrying in {delay:.1f}s…"
+        )
+        time.sleep(delay)
+
+
+def normalise_url(url):
+    """Normalise URLs for 'key' comparison.
+
+    - force https
+    - strip query and fragment
+    - remove leading www.
+    - collapse root '/' to empty
+    """
+    if not url:
+        return None
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url
+
+    scheme = "https"
+    netloc = parsed.netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+
+    path = parsed.path or ""
+    if path == "/":
+        path = ""
+
+    return f"{scheme}://{netloc}{path}"
+
+
+def site_key_from_url(url):
+    """Return a domain/site key (host with www. stripped)."""
+    if not url:
+        return None
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+
+    return host or None
+
+
+def extract_urls_from_item(item):
+    """Extract all URLs from an item."""
+    urls = set()
+
+    legacy_url = item.get("url")
+    if legacy_url:
+        urls.add(legacy_url)
+
+    for u in item.get("urls", []):
+        if isinstance(u, dict):
+            href = u.get("href")
+            if href:
+                urls.add(href)
+        elif isinstance(u, str):
+            urls.add(u)
+
+    return urls
+
+
+def extract_username_from_item(item):
+    """Extract a username for the item.
+
+    Priority:
+    1. fields with purpose == 'USERNAME'
+    2. fields with label in ('username', 'user name', 'login')
+    3. top-level 'username' key if present
+
+    Returns an empty string if no username is found.
+    """
+    # 1) Purpose-based (most robust in 1Password 8)
+    for field in item.get("fields", []):
+        purpose = (field.get("purpose") or "").upper()
+        if purpose == "USERNAME":
+            return (field.get("value") or "").strip()
+
+    # 2) Label-based fallbacks
+    for field in item.get("fields", []):
+        label = (field.get("label") or "").strip().lower()
+        if label in ("username", "user name", "login"):
+            return (field.get("value") or "").strip()
+
+    # 3) Top-level username if present
+    if "username" in item:
+        return (item.get("username") or "").strip()
+
+    # 4) No username found
+    return ""
+
+
+def parse_timestamp(value):
+    """Parse a timestamp from the item into epoch seconds."""
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return 0.0
+        try:
+            # Handle trailing Z as UTC
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except Exception:
+            return 0.0
+
+    return 0.0
+
+
+def get_best_timestamp(item):
+    """Best timestamp: updated_at if available, else created_at."""
+    updated_ts = parse_timestamp(item.get("updated_at"))
+    created_ts = parse_timestamp(item.get("created_at"))
+    return updated_ts or created_ts
+
+
+def format_timestamp(ts):
+    """Format epoch seconds as an ISO-like local datetime string."""
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromtimestamp(ts)
+        return dt.isoformat(sep=" ", timespec="seconds")
+    except Exception:
+        return ""
 
 
 def choose_vault():
-    """
-    Interactively prompt the user to select a vault.
-
-    If OP_VAULT is set in the environment, that is used directly and no prompt is shown.
-    """
+    """Interactively prompt the user to select a vault, or use OP_VAULT."""
     env_vault = os.environ.get("OP_VAULT")
     if env_vault:
         print(f"🔐 Using vault from OP_VAULT: {env_vault}")
@@ -40,24 +209,35 @@ def choose_vault():
     if not vaults:
         raise RuntimeError("No vaults found for this account.")
 
-    print("\n📁 Available vaults:")
-    for idx, v in enumerate(vaults, start=1):
-        print(f"  {idx}. {v['name']}")
+    print("\n📁 Available vaults...")
+    for i, v in enumerate(vaults, start=1):
+        print(f"  {i}. {v['name']}  (id: {v['id']})")
 
     while True:
-        choice = input("\nSelect a vault by number: ").strip()
-        if choice.isdigit():
-            i = int(choice)
-            if 1 <= i <= len(vaults):
-                chosen = vaults[i - 1]["name"]
-                print(f"\n✅ Selected vault: {chosen}\n")
-                return chosen
-        print("⚠️ Invalid selection. Please enter a valid number.")
+        choice = input("\nSelect a vault by number (or press Enter for all vaults): ").strip()
+        if choice == "":
+            print("📦 No specific vault selected: scanning all vaults.")
+            return None  # Means "all vaults"
+        if not choice.isdigit():
+            print("Please enter a number corresponding to a vault, or press Enter.")
+            continue
+
+        index = int(choice)
+        if 1 <= index <= len(vaults):
+            selected = vaults[index - 1]
+            print(f"✅ Selected vault: {selected['name']} (id: {selected['id']})")
+            return selected["id"]
+        else:
+            print("Invalid selection. Try again.")
 
 
-def get_item_ids(vault_name):
-    """Return list of item IDs from the given vault."""
-    out = run_op(["item", "list", "--vault", vault_name, "--format", "json"])
+def get_items(vault_id=None):
+    """Return list of item IDs from 1Password."""
+    args = ["item", "list", "--format", "json"]
+    if vault_id:
+        args.extend(["--vault", vault_id])
+
+    out = run_op(args)
     items = json.loads(out)
     return [item["id"] for item in items]
 
@@ -73,10 +253,7 @@ def fetch_all_items_parallel(ids):
     items = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_id = {executor.submit(fetch_one_item, item_id): item_id for item_id in ids}
-        for future in tqdm(as_completed(future_to_id),
-                           total=len(future_to_id),
-                           desc="📥 Fetching items",
-                           unit="item"):
+        for future in tqdm(as_completed(future_to_id), total=len(ids), desc="Fetching items"):
             item_id = future_to_id[future]
             try:
                 item = future.result()
@@ -86,212 +263,218 @@ def fetch_all_items_parallel(ids):
     return items
 
 
-def normalize_url(href):
+def build_duplicate_index(items):
+    """Build duplicate groups according to:
+
+    1. same domain name AND username
+    2. same key AND username
+
+    - domain name: host part of any URL (www. stripped)
+    - key: normalised full URL (scheme + host + path)
     """
-    Normalise a URL so that logically identical URLs group together.
-    - Lowercase scheme and host
-    - Strip trailing slash from path
-    - Ignore query/fragment for dedupe purposes
-    """
-    try:
-        parsed = urlparse(href)
-        scheme = (parsed.scheme or "https").lower()
-        netloc = parsed.netloc.lower()
-        path = (parsed.path or "").rstrip("/")
-        return f"{scheme}://{netloc}{path}"
-    except Exception:
-        return href or ""
-
-
-def get_domain(href):
-    try:
-        return urlparse(href).netloc.lower()
-    except Exception:
-        return ""
-
-
-def is_localhost_domain(domain):
-    if not domain:
-        return False
-    if domain in {"localhost", "127.0.0.1"}:
-        return True
-    if domain.endswith(".local"):
-        return True
-    return False
-
-
-def get_best_timestamp(item):
-    """
-    Prefer updatedAt / updated_at, then createdAt / created_at.
-    Returns an ISO-like string or "".
-    """
-    return (
-        item.get("updatedAt")
-        or item.get("updated_at")
-        or item.get("createdAt")
-        or item.get("created_at")
-        or ""
-    )
-
-
-def is_protocol_only_url(href):
-    """Detect URLs that are just 'http://' or 'https://' with no host."""
-    href = (href or "").strip().lower()
-    return href in ("http://", "https://")
-
-
-def identify_duplicates(items):
-    """
-    Group items to find duplicates.
-
-    Rules:
-    - For normal sites: key = (normalized_full_url, username)
-    - For localhost / 127.0.0.1 / *.local: key = ("local", username, normalized_title)
-    - For protocol-only URLs ('http://', 'https://'): treat as 'no real URL' and
-      key = ("no_url", username, normalized_title)
-    """
-    grouped = defaultdict(list)
+    by_domain_and_username = defaultdict(list)
+    by_key_and_username = defaultdict(list)
 
     for item in items:
-        urls = item.get("urls", [])
-        fields = item.get("fields", [])
-        updated = get_best_timestamp(item)
-        title = item.get("title", "") or ""
-        item_id = item.get("id")
+        username = extract_username_from_item(item)
+        username_key = username.strip().lower()
 
-        # Find username field
-        username = None
-        for f in fields:
-            if f.get("id") == "username":
-                username = f.get("value")
-                break
+        urls = extract_urls_from_item(item)
+        norm_urls = [normalise_url(u) for u in urls if u]
 
-        if not username:
+        # Rule 1: same domain name AND username
+        domains = set()
+        for u in urls:
+            d = site_key_from_url(u)
+            if d:
+                domains.add(d)
+        for domain in domains:
+            by_domain_and_username[(domain, username_key)].append(item)
+
+        # Rule 2: same key AND username (key = normalised URL)
+        for nu in norm_urls:
+            if nu:
+                by_key_and_username[(nu, username_key)].append(item)
+
+    return by_domain_and_username, by_key_and_username
+
+
+def find_duplicates(by_domain_and_username, by_key_and_username):
+    """Create duplicate groups based on the rules."""
+    groups = []
+
+    for key, items in by_domain_and_username.items():
+        if len(items) > 1:
+            groups.append({"reason": "domain+username", "key": key, "items": items})
+
+    for key, items in by_key_and_username.items():
+        if len(items) > 1:
+            groups.append({"reason": "key+username", "key": key, "items": items})
+
+    return groups
+
+
+def choose_newest_item(items):
+    """Return the newest item in a list based on best timestamp."""
+    sorted_items = sorted(items, key=lambda i: get_best_timestamp(i), reverse=True)
+    return sorted_items[0]
+
+
+def summarise_item(item):
+    """Return a compact summary for CSV/reporting."""
+    title = item.get("title") or item.get("overview", {}).get("title") or ""
+    vault = item.get("vault", {}).get("name") or ""
+    url_set = extract_urls_from_item(item)
+    urls = ", ".join(sorted(url_set)) if url_set else ""
+    username = extract_username_from_item(item)
+    last_ts = get_best_timestamp(item)
+    last_updated = format_timestamp(last_ts)
+    return title, vault, urls, username, last_updated
+
+
+def write_report(groups):
+    """Write duplicates report to CSV_REPORT.
+
+    Rules:
+    - For domain+username groups: keep_or_delete = 'review' for all items.
+    - For key+username groups:
+        newest  -> is_newer='YES', keep_or_delete='keep'
+        others  -> is_newer='',     keep_or_delete='delete'
+    """
+    with open(CSV_REPORT, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "group_id",
+            "reason",
+            "key",
+            "keep_or_delete",
+            "item_id",
+            "title",
+            "vault",
+            "urls",
+            "username",
+            "last_updated",
+            "is_newer",
+        ])
+
+        for idx, group in enumerate(groups, start=1):
+            reason = group["reason"]
+            key = group["key"]
+
+            # Compute newest for this group for info / key+username decisions
+            newest = choose_newest_item(group["items"])
+            newest_id = newest["id"]
+
+            for item in group["items"]:
+                is_newer = "YES" if item["id"] == newest_id else ""
+
+                if reason == "domain+username":
+                    # Manual review only
+                    keep_or_delete = "review"
+                elif reason == "key+username":
+                    # Auto suggestion: newest keep, others delete
+                    keep_or_delete = "keep" if is_newer == "YES" else "delete"
+                else:
+                    # Shouldn't happen, but be defensive
+                    keep_or_delete = "review"
+
+                title, vault, urls, username, last_updated = summarise_item(item)
+                writer.writerow([
+                    idx,
+                    reason,
+                    repr(key),
+                    keep_or_delete,
+                    item["id"],
+                    title,
+                    vault,
+                    urls,
+                    username,
+                    last_updated,
+                    is_newer,
+                ])
+
+    print(f"📄 Duplicate report written to {CSV_REPORT}")
+
+
+def delete_duplicates(groups):
+    """Delete items according to the key+username rule only.
+
+    - For key+username groups: delete items where keep_or_delete would be 'delete'
+      (i.e. older items), keep the newest.
+    - For domain+username groups: never delete automatically (manual review only).
+    """
+    for idx, group in enumerate(groups, start=1):
+        reason = group["reason"]
+        key = group["key"]
+
+        print(f"\n🧹 Group {idx} ({reason} = {key})")
+
+        if reason == "domain+username":
+            print("   Skipping automatic deletion (manual review group).")
+            for item in group["items"]:
+                title, vault, urls, username, last_updated = summarise_item(item)
+                print(f"   REVIEW: {item['id']} - {title} [{vault}] ({urls})")
             continue
 
-        href_raw = urls[0].get("href", "") if urls else ""
-        domain = get_domain(href_raw)
-        normalized_href = normalize_url(href_raw) if href_raw else ""
+        if reason == "key+username":
+            newest = choose_newest_item(group["items"])
+            newest_id = newest["id"]
+            print(f"   Keeping newest: {newest_id} - {summarise_item(newest)[0]}")
 
-        # Decide grouping key
-        if is_localhost_domain(domain):
-            # Local app-style entries: use title + username as key
-            key = ("local", username.strip().lower(), title.strip().lower())
-            effective_url = href_raw  # keep original for reporting only
-        elif is_protocol_only_url(href_raw) or normalized_href in ("http://", "https://", ""):
-            # Protocol-only or effectively no URL: group by title+username
-            key = ("no_url", username.strip().lower(), title.strip().lower())
-            effective_url = ""  # treat as no meaningful URL
+            for item in group["items"]:
+                if item["id"] == newest_id:
+                    continue
+                title, vault, urls, username, last_updated = summarise_item(item)
+                print(f"   Deleting older: {item['id']} - {title} [{vault}] ({urls})")
+                try:
+                    run_op(["item", "delete", item["id"], "--yes"])
+                except Exception as e:
+                    print(f"   ⚠️ Failed to delete {item['id']}: {e}")
         else:
-            if not href_raw:
-                # No URL and not localhost / protocol-only: skip
-                continue
-            key = (normalized_href, username.strip().lower())
-            effective_url = normalized_href
-
-        grouped[key].append({
-            "id": item_id,
-            "title": title,
-            "updated": updated,
-            "url": effective_url,
-            "domain": domain,
-            "username": username,
-        })
-
-    # Only keep keys with more than one item (actual duplicates)
-    return {k: v for k, v in grouped.items() if len(v) > 1}
+            print("   Unknown reason; no automatic deletion performed.")
 
 
-def write_report(dupes):
-    print(f"📝 Writing CSV report to: {CSV_REPORT}")
-    with open(CSV_REPORT, mode="w", newline="") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "key_type",
-                "url_or_title_key",
-                "username",
-                "item_id",
-                "title",
-                "url",
-                "updatedAt",
-                "is_newest",
-                "action",
-            ],
-        )
-        writer.writeheader()
-
-        for key, group in dupes.items():
-            # Decode key for reporting
-            if key[0] == "local":
-                key_type = "local_app"
-                _, uname_key, title_key = key
-                url_or_title_key = title_key
-                key_username = uname_key
-            elif key[0] == "no_url":
-                key_type = "no_url"
-                _, uname_key, title_key = key
-                url_or_title_key = title_key
-                key_username = uname_key
-            else:
-                key_type = "full_url"
-                url_key, uname_key = key
-                url_or_title_key = url_key
-                key_username = uname_key
-
-            # Newest first (ISO timestamps sort lexicographically fine)
-            sorted_group = sorted(group, key=lambda x: x["updated"], reverse=True)
-
-            # Auto title propagation:
-            # If the newest (KEEP) item has an empty title and there exists a
-            # non-empty title in another item, copy that title into the KEEP row
-            keep_item = sorted_group[0]
-            if not keep_item["title"]:
-                for candidate in sorted_group[1:]:
-                    if candidate["title"]:
-                        keep_item["title"] = candidate["title"]
-                        break
-
-            for i, item in enumerate(sorted_group):
-                is_newest = "YES" if i == 0 else ""  # blank for others
-                action = "KEEP" if i == 0 else "DELETE"
-                writer.writerow({
-                    "key_type": key_type,
-                    "url_or_title_key": url_or_title_key,
-                    "username": key_username,
-                    "item_id": item["id"],
-                    "title": item["title"],
-                    "url": item["url"],
-                    "updatedAt": item["updated"],
-                    "is_newest": is_newest,
-                    "action": action,
-                })
+def parse_args(argv=None):
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Find duplicate items in 1Password vaults.")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=MAX_WORKERS,
+        help="Number of parallel workers to use when fetching items (default: %(default)s).",
+    )
+    return parser.parse_args(argv)
 
 
-def delete_duplicates(dupes):
-    print("🗑️ Deleting older duplicates...")
-    groups = list(dupes.values())
-    for group in tqdm(groups, desc="🚮 Deleting", unit="group"):
-        sorted_group = sorted(group, key=lambda x: x["updated"], reverse=True)
-        to_delete = sorted_group[1:]  # keep newest
-        for item in to_delete:
-            try:
-                run_op(["item", "delete", item["id"]])
-            except Exception as e:
-                print(f"⚠️ Failed to delete {item['title']} ({item['id']}): {e}")
-    print("✅ Deletion complete.")
+def main(argv=None):
+    global MAX_WORKERS
 
+    args = parse_args(argv)
+    if args.workers < 1:
+        print("⚠️ --workers must be at least 1; defaulting to 1.")
+        MAX_WORKERS = 1
+    else:
+        MAX_WORKERS = args.workers
 
-def main():
     try:
-        vault_name = choose_vault()
-        ids = get_item_ids(vault_name)
-        print(f"🔎 Found {len(ids)} items in vault '{vault_name}'.")
+        vault_id = choose_vault()
+        print("\n📥 Fetching items...")
+        ids = get_items(vault_id=vault_id)
+
+        if not ids:
+            print("No items found. Exiting.")
+            return
+
         items = fetch_all_items_parallel(ids)
 
-        dupes = identify_duplicates(items)
+        print("🔍 Building duplicate index...")
+        idx_domain, idx_key = build_duplicate_index(items)
+
+        print("🧭 Finding potential duplicates...")
+        dupes = find_duplicates(idx_domain, idx_key)
+
         if not dupes:
-            print("✅ No duplicates found.")
+            print("✅ No duplicates found. Nice and tidy!")
             return
 
         write_report(dupes)
@@ -300,7 +483,7 @@ def main():
             delete_duplicates(dupes)
         else:
             print("🛡️ Test mode: no items were deleted.")
-            print(f"📄 Open '{CSV_REPORT}' to review what would be deleted and what titles/URLs are suggested.")
+            print(f"📄 Open '{CSV_REPORT}' to review 'review' rows and keep/delete suggestions.")
     except Exception as e:
         print(f"❌ Error: {e}")
 
